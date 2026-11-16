@@ -7,3 +7,5 @@
 
 # Generated dependency lock files
 **/uv.lock linguist-generated=true
+
+.github/workflows/*.lock.yml linguist-generated=true

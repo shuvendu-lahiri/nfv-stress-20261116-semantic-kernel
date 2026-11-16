@@ -1,0 +1,303 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+import pytest
+from google.genai.types import FinishReason, GenerateContentResponse, GenerateContentResponseUsageMetadata, Part
+
+from semantic_kernel.connectors.ai.google.google_ai.services.utils import (
+    finish_reason_from_google_ai_to_semantic_kernel,
+    format_assistant_message,
+    format_user_message,
+    get_completion_token_count,
+    kernel_function_metadata_to_google_ai_function_call_format,
+)
+from semantic_kernel.contents.chat_message_content import ChatMessageContent
+from semantic_kernel.contents.function_call_content import FunctionCallContent
+from semantic_kernel.contents.function_result_content import FunctionResultContent
+from semantic_kernel.contents.image_content import ImageContent
+from semantic_kernel.contents.text_content import TextContent
+from semantic_kernel.contents.utils.author_role import AuthorRole
+from semantic_kernel.contents.utils.finish_reason import FinishReason as SemanticKernelFinishReason
+from semantic_kernel.exceptions.service_exceptions import ServiceInvalidRequestError
+from semantic_kernel.functions.kernel_function_metadata import KernelFunctionMetadata
+from semantic_kernel.functions.kernel_parameter_metadata import KernelParameterMetadata
+
+
+def test_finish_reason_from_google_ai_to_semantic_kernel():
+    """Test finish_reason_from_google_ai_to_semantic_kernel."""
+    assert finish_reason_from_google_ai_to_semantic_kernel(FinishReason.STOP) == SemanticKernelFinishReason.STOP
+    assert finish_reason_from_google_ai_to_semantic_kernel(FinishReason.MAX_TOKENS) == SemanticKernelFinishReason.LENGTH
+    assert (
+        finish_reason_from_google_ai_to_semantic_kernel(FinishReason.SAFETY)
+        == SemanticKernelFinishReason.CONTENT_FILTER
+    )
+    assert finish_reason_from_google_ai_to_semantic_kernel(FinishReason.OTHER) is None
+    assert finish_reason_from_google_ai_to_semantic_kernel(None) is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        FinishReason.RECITATION,
+        FinishReason.BLOCKLIST,
+        FinishReason.PROHIBITED_CONTENT,
+        FinishReason.SPII,
+        FinishReason.IMAGE_SAFETY,
+        FinishReason.IMAGE_PROHIBITED_CONTENT,
+    ],
+)
+def test_content_filter_finish_reasons_from_google_ai(reason):
+    """Responses Gemini stopped for their content are reported as content filtered."""
+    assert finish_reason_from_google_ai_to_semantic_kernel(reason) == SemanticKernelFinishReason.CONTENT_FILTER
+
+
+def test_format_user_message():
+    """Test format_user_message."""
+    user_message = ChatMessageContent(role=AuthorRole.USER, content="User message")
+    formatted_user_message = format_user_message(user_message)
+
+    assert len(formatted_user_message) == 1
+    assert isinstance(formatted_user_message[0], Part)
+    assert formatted_user_message[0].text == "User message"
+
+    # Test with an image content
+    image_content = ImageContent(data="image data", mime_type="image/png")
+    user_message = ChatMessageContent(
+        role=AuthorRole.USER,
+        items=[
+            TextContent(text="Text content"),
+            image_content,
+        ],
+    )
+    formatted_user_message = format_user_message(user_message)
+
+    assert len(formatted_user_message) == 2
+    assert isinstance(formatted_user_message[0], Part)
+    assert formatted_user_message[0].text == "Text content"
+    assert isinstance(formatted_user_message[1], Part)
+    assert formatted_user_message[1].inline_data.mime_type == "image/png"
+    assert formatted_user_message[1].inline_data.data == image_content.data
+
+
+def test_format_user_message_throws_with_unsupported_items() -> None:
+    """Test format_user_message with unsupported items."""
+    # Test with unsupported items, any item other than TextContent and ImageContent should raise an error
+    user_message = ChatMessageContent(
+        role=AuthorRole.USER,
+        items=[
+            FunctionCallContent(),
+        ],
+    )
+    with pytest.raises(ServiceInvalidRequestError):
+        format_user_message(user_message)
+
+    # Test with an ImageContent that has no data_uri
+    user_message = ChatMessageContent(
+        role=AuthorRole.USER,
+        items=[
+            ImageContent(data_uri=""),
+        ],
+    )
+    with pytest.raises(ServiceInvalidRequestError):
+        format_user_message(user_message)
+
+
+def test_format_assistant_message() -> None:
+    assistant_message = ChatMessageContent(
+        role=AuthorRole.ASSISTANT,
+        items=[
+            TextContent(text="test"),
+            FunctionCallContent(name="test_function", arguments={}),
+            ImageContent(data="image data", mime_type="image/png"),
+        ],
+    )
+
+    formatted_assistant_message = format_assistant_message(assistant_message)
+    assert isinstance(formatted_assistant_message, list)
+    assert len(formatted_assistant_message) == 3
+    assert isinstance(formatted_assistant_message[0], Part)
+    assert formatted_assistant_message[0].text == "test"
+    assert isinstance(formatted_assistant_message[1], Part)
+    assert formatted_assistant_message[1].function_call.name == "test_function"
+    assert formatted_assistant_message[1].function_call.args == {}
+    assert isinstance(formatted_assistant_message[2], Part)
+    assert formatted_assistant_message[2].inline_data
+
+
+def test_format_assistant_message_with_unsupported_items() -> None:
+    assistant_message = ChatMessageContent(
+        role=AuthorRole.ASSISTANT,
+        items=[
+            FunctionResultContent(id="test_id", function_name="test_function"),
+        ],
+    )
+
+    with pytest.raises(ServiceInvalidRequestError):
+        format_assistant_message(assistant_message)
+
+
+def test_format_assistant_message_with_thought_signature() -> None:
+    """Test that thought_signature is preserved in function call parts."""
+    import base64
+
+    thought_sig = base64.b64encode(b"test_thought_signature_data")
+    assistant_message = ChatMessageContent(
+        role=AuthorRole.ASSISTANT,
+        items=[
+            FunctionCallContent(
+                name="test_function",
+                arguments={"arg1": "value1"},
+                metadata={"thought_signature": thought_sig},
+            ),
+        ],
+    )
+
+    formatted = format_assistant_message(assistant_message)
+    assert len(formatted) == 1
+    assert isinstance(formatted[0], Part)
+    assert formatted[0].function_call.name == "test_function"
+    assert formatted[0].function_call.args == {"arg1": "value1"}
+    assert formatted[0].thought_signature == thought_sig
+
+
+def test_format_assistant_message_without_thought_signature() -> None:
+    """Test that function calls without thought_signature still work."""
+    assistant_message = ChatMessageContent(
+        role=AuthorRole.ASSISTANT,
+        items=[
+            FunctionCallContent(
+                name="test_function",
+                arguments={"arg1": "value1"},
+            ),
+        ],
+    )
+
+    formatted = format_assistant_message(assistant_message)
+    assert len(formatted) == 1
+    assert isinstance(formatted[0], Part)
+    assert formatted[0].function_call.name == "test_function"
+    assert formatted[0].function_call.args == {"arg1": "value1"}
+    assert not getattr(formatted[0], "thought_signature", None)
+
+
+def test_google_ai_function_call_format_sanitizes_anyof_schema() -> None:
+    """Integration test: anyOf in param schema_data is sanitized in the output dict."""
+    metadata = KernelFunctionMetadata(
+        name="test_func",
+        description="A test function",
+        is_prompt=False,
+        parameters=[
+            KernelParameterMetadata(
+                name="messages",
+                description="The user messages",
+                is_required=True,
+                schema_data={
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                    "description": "The user messages",
+                },
+            ),
+        ],
+    )
+    result = kernel_function_metadata_to_google_ai_function_call_format(metadata)
+    param_schema = result["parameters"]["properties"]["messages"]
+    assert "anyOf" not in param_schema
+    assert param_schema["type"] == "string"
+
+
+def test_google_ai_function_call_format_empty_parameters() -> None:
+    """Integration test: metadata with no parameters produces parameters=None."""
+    metadata = KernelFunctionMetadata(
+        name="no_params_func",
+        description="No parameters",
+        is_prompt=False,
+        parameters=[],
+    )
+    result = kernel_function_metadata_to_google_ai_function_call_format(metadata)
+    assert result["parameters"] is None
+
+
+def test_google_ai_function_call_format_skips_params_excluded_from_function_choices() -> None:
+    metadata = KernelFunctionMetadata(
+        name="lookup",
+        description="Look up a user",
+        is_prompt=False,
+        parameters=[
+            KernelParameterMetadata(
+                name="query", description="What to look up", schema_data={"type": "string"}, is_required=True
+            ),
+            KernelParameterMetadata(
+                name="token",
+                description="Internal",
+                schema_data={"type": "string"},
+                is_required=True,
+                include_in_function_choices=False,
+            ),
+        ],
+    )
+    result = kernel_function_metadata_to_google_ai_function_call_format(metadata)
+    assert list(result["parameters"]["properties"]) == ["query"]
+    assert result["parameters"]["required"] == ["query"]
+
+
+def test_google_ai_function_call_format_all_params_excluded_gives_no_parameters() -> None:
+    metadata = KernelFunctionMetadata(
+        name="hidden_only",
+        description="Only hidden parameters",
+        is_prompt=False,
+        parameters=[
+            KernelParameterMetadata(name="token", schema_data={"type": "string"}, include_in_function_choices=False),
+        ],
+    )
+    result = kernel_function_metadata_to_google_ai_function_call_format(metadata)
+    assert result["parameters"] is None
+
+
+@pytest.mark.parametrize(
+    ("candidates_tokens", "thoughts_tokens", "expected"),
+    [
+        (10, 40, 50),
+        (10, None, 10),
+        (None, 40, 40),
+        (0, 0, 0),
+        (None, None, None),
+    ],
+)
+def test_get_completion_token_count_includes_thinking_tokens(candidates_tokens, thoughts_tokens, expected) -> None:
+    usage_metadata = GenerateContentResponseUsageMetadata(
+        prompt_token_count=5, candidates_token_count=candidates_tokens, thoughts_token_count=thoughts_tokens
+    )
+    assert get_completion_token_count(usage_metadata) == expected
+
+
+def test_get_completion_token_count_without_usage_metadata() -> None:
+    assert get_completion_token_count(None) is None
+
+
+def test_chat_completion_usage_counts_thinking_tokens(google_ai_unit_test_env) -> None:
+    from semantic_kernel.connectors.ai.google.google_ai.services.google_ai_chat_completion import (
+        GoogleAIChatCompletion,
+    )
+
+    response = GenerateContentResponse(
+        usage_metadata=GenerateContentResponseUsageMetadata(
+            prompt_token_count=5, candidates_token_count=10, thoughts_token_count=40, total_token_count=55
+        )
+    )
+    usage = GoogleAIChatCompletion()._get_metadata_from_response(response)["usage"]
+    assert (usage.prompt_tokens, usage.completion_tokens) == (5, 50)
+
+
+def test_text_completion_usage_counts_thinking_tokens(google_ai_unit_test_env) -> None:
+    from semantic_kernel.connectors.ai.google.google_ai.services.google_ai_text_completion import (
+        GoogleAITextCompletion,
+    )
+
+    response = GenerateContentResponse(
+        usage_metadata=GenerateContentResponseUsageMetadata(
+            prompt_token_count=5, candidates_token_count=10, thoughts_token_count=40, total_token_count=55
+        )
+    )
+    usage = GoogleAITextCompletion()._get_metadata_from_response(response)["usage"]
+    assert (usage.prompt_tokens, usage.completion_tokens) == (5, 50)

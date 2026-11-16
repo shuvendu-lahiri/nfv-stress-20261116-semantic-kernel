@@ -1,0 +1,740 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+import json
+import sys
+from dataclasses import dataclass
+from typing import Annotated, NamedTuple
+from unittest.mock import AsyncMock, MagicMock, NonCallableMagicMock, patch
+
+from pytest import fixture, mark, param, raises
+
+from semantic_kernel.connectors.sql_server import (
+    QueryBuilder,
+    SqlCommand,
+    SqlServerCollection,
+    SqlServerStore,
+    _build_create_table_query,
+    _build_delete_query,
+    _build_delete_table_query,
+    _build_merge_query,
+    _build_search_query,
+    _build_select_query,
+    _build_select_table_names_query,
+)
+from semantic_kernel.data.vector import (
+    DistanceFunction,
+    IndexKind,
+    VectorSearchOptions,
+    VectorStoreField,
+    default_dynamic_filter_function,
+    vectorstoremodel,
+)
+from semantic_kernel.exceptions.vector_store_exceptions import (
+    VectorStoreInitializationException,
+    VectorStoreModelValidationError,
+    VectorStoreOperationException,
+)
+from semantic_kernel.functions.kernel_parameter_metadata import KernelParameterMetadata
+
+
+class TestQueryBuilder:
+    def test_query_builder_append(self):
+        qb = QueryBuilder()
+        qb.append("SELECT * FROM")
+        qb.append(" table", suffix=";")
+        result = str(qb).strip()
+        assert result == "SELECT * FROM table;"
+
+    def test_query_builder_append_list(self):
+        qb = QueryBuilder()
+        qb.append_list(["id", "name", "age"], sep=", ", suffix=";")
+        result = str(qb).strip()
+        assert result == "id, name, age;"
+
+    def test_query_builder_escape_identifier(self):
+        assert QueryBuilder.escape_identifier("simple") == "[simple]"
+        assert QueryBuilder.escape_identifier("has]bracket") == "[has]]bracket]"
+        assert QueryBuilder.escape_identifier("two]]brackets") == "[two]]]]brackets]"
+        assert QueryBuilder.escape_identifier("") == "[]"
+
+    def test_query_builder_append_table_name(self):
+        qb = QueryBuilder()
+        qb.append_table_name("dbo", "Users", prefix="SELECT * FROM", suffix=";", newline=False)
+        result = str(qb).strip()
+        assert result == "SELECT * FROM [dbo].[Users] ;"
+
+    def test_query_builder_append_table_name_escapes_closing_bracket(self):
+        qb = QueryBuilder()
+        qb.append_table_name("my]schema", "my]table", prefix="SELECT * FROM", suffix=";")
+        result = str(qb).strip()
+        assert result == "SELECT * FROM [my]]schema].[my]]table] ;"
+
+    def test_query_builder_append_table_name_prevents_sql_injection(self):
+        qb = QueryBuilder()
+        qb.append("DROP TABLE IF EXISTS")
+        qb.append_table_name("dbo", "]; EXEC xp_cmdshell('whoami'); --", suffix=";")
+        result = str(qb)
+        assert "EXEC xp_cmdshell" not in result.split("].[")[0], "SQL injection should not escape bracket quoting"
+        assert "[dbo].[]]; EXEC xp_cmdshell('whoami'); --]" in result
+
+    def test_query_builder_remove_last(self):
+        qb = QueryBuilder("SELECT * FROM table;")
+        qb.remove_last(1)  # remove trailing semicolon
+        result = str(qb).strip()
+        assert result == "SELECT * FROM table"
+
+    def test_query_builder_in_parenthesis(self):
+        qb = QueryBuilder("INSERT INTO table")
+        with qb.in_parenthesis():
+            qb.append("id, name, age")
+        result = str(qb).strip()
+        assert result == "INSERT INTO table (id, name, age)"
+
+    def test_query_builder_in_parenthesis_with_prefix_suffix(self):
+        qb = QueryBuilder()
+        with qb.in_parenthesis(prefix="VALUES", suffix=";"):
+            qb.append_list(["1", "'John'", "30"])
+        result = str(qb).strip()
+        assert result == "VALUES (1, 'John', 30) ;"
+
+    def test_query_builder_in_logical_group(self):
+        qb = QueryBuilder()
+        with qb.in_logical_group():
+            qb.append("UPDATE Users SET name = 'John'")
+        result = str(qb).strip()
+        lines = result.splitlines()
+        assert lines[0] == "BEGIN"
+        assert lines[1] == "UPDATE Users SET name = 'John'"
+        assert lines[2] == "END"
+
+
+class TestSqlCommand:
+    def test_sql_command_initial_query(self):
+        cmd = SqlCommand("SELECT 1")
+        assert str(cmd.query) == "SELECT 1"
+
+    def test_sql_command_add_parameter(self):
+        cmd = SqlCommand("SELECT * FROM Test WHERE id = ?")
+        cmd.add_parameter("42")
+        assert cmd.parameters[0] == "42"
+
+    def test_sql_command_add_parameters(self):
+        cmd = SqlCommand("SELECT * FROM Test WHERE id = ?")
+        cmd.add_parameters(["42", "43"])
+        assert cmd.parameters[0] == "42"
+        assert cmd.parameters[1] == "43"
+
+    def test_parameter_limit(self):
+        cmd = SqlCommand()
+        cmd.add_parameters(["42"] * 2100)
+        with raises(VectorStoreOperationException):
+            cmd.add_parameter("43")
+        with raises(VectorStoreOperationException):
+            cmd.add_parameters(["43", "44"])
+
+
+class TestQueryBuildFunctions:
+    def test_build_create_table_query(self):
+        schema = "dbo"
+        table = "Test"
+        key_field = VectorStoreField("key", name="id", type="str")
+        data_fields = [
+            VectorStoreField("data", name="name", type="str"),
+            VectorStoreField("data", name="age", type="int"),
+        ]
+        vector_fields = [
+            VectorStoreField("vector", name="embedding", type="float", dimensions=1536),
+        ]
+        cmd = _build_create_table_query(schema, table, key_field, data_fields, vector_fields)
+        assert not cmd.parameters
+        cmd_str = str(cmd.query)
+        assert (
+            cmd_str
+            == "BEGIN\nCREATE TABLE [dbo].[Test] \n ([id] nvarchar(255) NOT NULL,\n[name] nvarchar(max) NULL,\n[age] "
+            "int NULL,\n[embedding] VECTOR(1536) NULL,\nPRIMARY KEY ([id]) \n) ;\nEND\n"
+        )
+
+    def test_build_create_table_query_escapes_single_quote_in_object_id(self):
+        key_field = VectorStoreField("key", name="id", type="str")
+        cmd = _build_create_table_query("dbo", "test'table", key_field, [], [], if_not_exists=True)
+        cmd_str = str(cmd.query)
+        # Single quote must be escaped inside the OBJECT_ID N'...' string literal
+        assert "OBJECT_ID(N'[dbo].[test''table]'" in cmd_str
+
+    def test_build_create_table_query_uses_storage_name_for_primary_key(self):
+        key_field = VectorStoreField("key", name="id", type="str", storage_name="pk_id")
+        cmd = _build_create_table_query("dbo", "Test", key_field, [], [])
+        cmd_str = str(cmd.query)
+        assert "[pk_id] nvarchar" in cmd_str
+        assert "PRIMARY KEY ([pk_id])" in cmd_str
+
+    @mark.parametrize(
+        ("field_type", "unsupported_type"),
+        [
+            ("datetime.date", "datetime.date"),
+            ("Optional[str]", "Optional[str]"),
+            ("uuid.UUID", "uuid.UUID"),
+            ("list[datetime.date]", "datetime.date"),
+        ],
+    )
+    def test_build_create_table_query_unsupported_field_type(self, field_type, unsupported_type):
+        key_field = VectorStoreField("key", name="id", type="str")
+        data_fields = [VectorStoreField("data", name="created", type=field_type)]
+        with raises(VectorStoreModelValidationError) as exc_info:
+            _build_create_table_query("dbo", "Test", key_field, data_fields, [])
+        message = str(exc_info.value)
+        assert f"SQL Server field type {unsupported_type!r} for field 'created' is not supported" in message
+        assert "Use a supported Python type, or create the table before using the collection." in message
+
+    def test_build_create_table_query_unsupported_key_field_type(self):
+        key_field = VectorStoreField("key", name="id", type="uuid.UUID")
+        with raises(VectorStoreModelValidationError) as exc_info:
+            _build_create_table_query("dbo", "Test", key_field, [], [])
+        message = str(exc_info.value)
+        assert "SQL Server field type 'uuid.UUID' for field 'id' is not supported" in message
+        assert "Use a supported Python type, or create the table before using the collection." in message
+
+    def test_build_merge_query_output_uses_storage_name(self):
+        key_field = VectorStoreField("key", name="id", type="str", storage_name="pk_id")
+        records = [{"pk_id": "1"}]
+        cmd = _build_merge_query("dbo", "Test", key_field, [], [], records)
+        cmd_str = str(cmd.query)
+        assert "OUTPUT inserted.[pk_id] INTO @UpsertedKeys" in cmd_str
+
+    def test_delete_table_query(self):
+        schema = "dbo"
+        table = "Test"
+        cmd = _build_delete_table_query(schema, table)
+        assert str(cmd.query) == f"DROP TABLE IF EXISTS [{schema}].[{table}] ;"
+
+    @mark.parametrize("schema", ["dbo", None])
+    def test_build_select_table_names_query(self, schema):
+        cmd = _build_select_table_names_query(schema)
+        if schema:
+            assert cmd.parameters == [schema]
+            assert str(cmd) == (
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE = 'BASE TABLE' "
+                "AND (@schema is NULL or TABLE_SCHEMA = ?);"
+            )
+        else:
+            assert str(cmd) == "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
+
+    def test_build_merge_query(self):
+        schema = "dbo"
+        table = "Test"
+        key_field = VectorStoreField("key", name="id", type="str")
+        data_fields = [
+            VectorStoreField("data", name="name", type="str"),
+            VectorStoreField("data", name="age", type="int"),
+        ]
+        vector_fields = [
+            VectorStoreField("vector", name="embedding", type="float", dimensions=5),
+        ]
+        records = [
+            {
+                "id": "test",
+                "name": "name",
+                "age": 50,
+                "embedding": [0.1, 0.2, 0.3, 0.4, 0.5],
+            }
+        ]
+        cmd = _build_merge_query(schema, table, key_field, data_fields, vector_fields, records)
+        assert cmd.parameters[0] == records[0]["id"]
+        assert cmd.parameters[1] == records[0]["name"]
+        assert cmd.parameters[2] == str(records[0]["age"])
+        assert cmd.parameters[3] == json.dumps(records[0]["embedding"])
+        str_cmd = str(cmd)
+        assert str_cmd == (
+            "DECLARE @UpsertedKeys TABLE (KeyColumn nvarchar(255));\n"
+            "MERGE INTO [dbo].[Test] AS t\n"
+            "USING ( VALUES  (?, ?, ?, ?) ) AS s ([id], [name], [age], [embedding])  "
+            "ON (t.[id] = s.[id]) \n"
+            "WHEN MATCHED THEN\n"
+            "UPDATE SET t.[name] = s.[name], t.[age] = s.[age], t.[embedding] = s.[embedding]\n"
+            "WHEN NOT MATCHED THEN\n"
+            "INSERT ([id], [name], [age], [embedding])  "
+            "VALUES (s.[id], s.[name], s.[age], s.[embedding])  \n"
+            "OUTPUT inserted.[id] INTO @UpsertedKeys (KeyColumn);\n"
+            "SELECT KeyColumn FROM @UpsertedKeys;\n"
+        )
+
+    def test_build_select_query(self):
+        schema = "dbo"
+        table = "Test"
+        key_field = VectorStoreField("key", name="id", type="str")
+        data_fields = [
+            VectorStoreField("data", name="name", type="str"),
+            VectorStoreField("data", name="age", type="int"),
+        ]
+        vector_fields = [
+            VectorStoreField("vector", name="embedding", type="float", dimensions=5),
+        ]
+        keys = ["test"]
+        cmd = _build_select_query(schema, table, key_field, data_fields, vector_fields, keys)
+        assert cmd.parameters == ["test"]
+        str_cmd = str(cmd)
+        assert str_cmd == "SELECT\n[id], [name], [age], [embedding] FROM [dbo].[Test] \nWHERE [id] IN\n (?) ;"
+
+    def test_build_delete_query(self):
+        schema = "dbo"
+        table = "Test"
+        key_field = VectorStoreField("key", name="id", type="str")
+        keys = ["test"]
+        cmd = _build_delete_query(schema, table, key_field, keys)
+        str_cmd = str(cmd)
+        assert cmd.parameters[0] == "test"
+        assert str_cmd == "DELETE FROM [dbo].[Test] WHERE [id] IN (?) ;"
+
+    def test_build_search_query(self):
+        schema = "dbo"
+        table = "Test"
+        key_field = VectorStoreField("key", name="id", type="str")
+        data_fields = [
+            VectorStoreField("data", name="name", type="str"),
+            VectorStoreField("data", name="age", type="int"),
+        ]
+        vector_fields = [
+            VectorStoreField(
+                "vector",
+                name="embedding",
+                type="float",
+                dimensions=5,
+                distance_function=DistanceFunction.COSINE_DISTANCE,
+            ),
+        ]
+        vector = [0.1, 0.2, 0.3, 0.4, 0.5]
+        options = VectorSearchOptions(
+            vector_property_name="embedding",
+        )
+
+        cmd = _build_search_query(schema, table, key_field, data_fields, vector_fields, vector, options)
+        assert cmd.parameters[0] == json.dumps(vector)
+        str_cmd = str(cmd)
+        assert (
+            str_cmd == "SELECT [id], [name], [age], VECTOR_DISTANCE('cosine', [embedding], CAST(? AS VECTOR(5))) as "
+            "_vector_distance_value\n FROM [dbo].[Test] \nORDER BY "
+            "_vector_distance_value ASC\nOFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY;"
+        )
+
+
+@fixture
+async def mock_connection(*args, **kwargs):
+    return MagicMock()
+
+
+@mark.parametrize(
+    "connection_string",
+    [
+        param(
+            "Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=testdb;uid=testuserLongAsMax=yes;",
+            id="with uid",
+        ),
+        param(
+            "Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=testdb;LongAsMax=yes;", id="credential"
+        ),
+    ],
+)
+async def test_get_mssql_connection(connection_string):
+    mock_pyodbc = NonCallableMagicMock()
+    sys.modules["pyodbc"] = mock_pyodbc
+
+    with patch("pyodbc.connect") as patched_connection:
+        from azure.core.credentials_async import AsyncTokenCredential
+
+        from semantic_kernel.connectors.sql_server import SqlSettings, _get_mssql_connection
+
+        token = MagicMock()
+        token.token.return_value = "test_token"
+        token.token.encode.return_value = b"test_token"
+        credential = AsyncMock(spec=AsyncTokenCredential)
+        credential.__aenter__.return_value = credential
+        credential.get_token.return_value = token
+
+        settings = SqlSettings(connection_string=connection_string)
+        with patch("semantic_kernel.connectors.sql_server.AsyncTokenCredential", return_value=credential):
+            connection = await _get_mssql_connection(settings, credential=credential)
+            assert connection is not None
+            assert isinstance(connection, MagicMock)
+            if "uid" in connection_string:
+                assert patched_connection.call_args.kwargs["attrs_before"] is None
+            else:
+                assert patched_connection.call_args.kwargs["attrs_before"] == {
+                    1256: b"\n\x00\x00\x00test_token",
+                }
+
+
+class TestSqlServerStore:
+    async def test_create_store(self, sql_server_unit_test_env):
+        store = SqlServerStore()
+        assert store is not None
+        assert store.settings is not None
+        assert store.settings.connection_string is not None
+        assert "LongAsMax=yes;" in store.settings.connection_string.get_secret_value()
+
+        with patch("semantic_kernel.connectors.sql_server._get_mssql_connection") as mock_get_connection:
+            mock_get_connection.return_value = AsyncMock()
+            await store.__aenter__()
+            assert store.connection is not None
+
+    @mark.parametrize(
+        "override_env_param_dict",
+        [
+            {
+                "SQL_SERVER_CONNECTION_STRING": "Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=testdb;User Id=testuser;Password=example;LongAsMax=yes;"  # noqa: E501
+            }
+        ],
+        indirect=True,
+    )
+    def test_create_store_with_long_as_max(self, sql_server_unit_test_env):
+        store = SqlServerStore()
+        assert store is not None
+        assert store.settings is not None
+        assert store.settings.connection_string is not None
+
+    @mark.parametrize("exclude_list", ["SQL_SERVER_CONNECTION_STRING"], indirect=True)
+    def test_create_without_connection_string(self, sql_server_unit_test_env):
+        with raises(VectorStoreInitializationException):
+            SqlServerStore(env_file_path="test.env")
+
+    def test_get_collection(self, sql_server_unit_test_env, definition):
+        store = SqlServerStore()
+        collection = store.get_collection(collection_name="test", record_type=dict, definition=definition)
+        assert collection is not None
+
+    async def test_list_collection_names(self, sql_server_unit_test_env, mock_connection):
+        async with SqlServerStore(connection=mock_connection) as store:
+            mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+                ["Test1"],
+                ["Test2"],
+            ]
+            collection_names = await store.list_collection_names()
+            assert collection_names == ["Test1", "Test2"]
+
+    async def test_no_connection(self, sql_server_unit_test_env):
+        store = SqlServerStore()
+        with raises(VectorStoreOperationException):
+            await store.list_collection_names()
+
+
+class TestSqlServerCollection:
+    @mark.parametrize("exclude_list", ["SQL_SERVER_CONNECTION_STRING"], indirect=True)
+    def test_create_without_connection_string(self, sql_server_unit_test_env, definition):
+        with raises(VectorStoreInitializationException):
+            SqlServerCollection(
+                collection_name="test",
+                record_type=dict,
+                definition=definition,
+                env_file_path="test.env",
+            )
+
+    async def test_create(self, sql_server_unit_test_env, definition):
+        collection = SqlServerCollection(collection_name="test", record_type=dict, definition=definition)
+        assert collection is not None
+        assert collection.collection_name == "test"
+        assert collection.settings is not None
+        assert collection.settings.connection_string is not None
+
+        with patch("semantic_kernel.connectors.sql_server._get_mssql_connection") as mock_get_connection:
+            mock_get_connection.return_value = AsyncMock()
+            await collection.__aenter__()
+            assert collection.connection is not None
+
+    async def test_upsert(
+        self,
+        sql_server_unit_test_env,
+        mock_connection,
+        definition,
+    ):
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+            connection=mock_connection,
+        )
+        record = {"id": "1", "content": "test", "vector": [0.1, 0.2, 0.3, 0.4, 0.5]}
+        mock_connection.cursor.return_value.__enter__.return_value.nextset.side_effect = [True, False]
+        mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+            ["1"],
+        ]
+        await collection.upsert(record)
+        mock_connection.cursor.return_value.__enter__.return_value.execute.assert_called_with(
+            (
+                "DECLARE @UpsertedKeys TABLE (KeyColumn nvarchar(255));\n"
+                "MERGE INTO [dbo].[test] AS t\n"
+                "USING ( VALUES  (?, ?, ?) ) AS s ([id], [content], [vector])  "
+                "ON (t.[id] = s.[id]) \n"
+                "WHEN MATCHED THEN\n"
+                "UPDATE SET t.[content] = s.[content], t.[vector] = s.[vector]\n"
+                "WHEN NOT MATCHED THEN\n"
+                "INSERT ([id], [content], [vector])  "
+                "VALUES (s.[id], s.[content], s.[vector])  \n"
+                "OUTPUT inserted.[id] INTO @UpsertedKeys (KeyColumn);\n"
+                "SELECT KeyColumn FROM @UpsertedKeys;\n"
+            ),
+            ("1", "test", json.dumps([0.1, 0.2, 0.3, 0.4, 0.5])),
+        )
+
+    async def test_get(
+        self,
+        sql_server_unit_test_env,
+        mock_connection,
+        definition,
+    ):
+        class MockRow(NamedTuple):
+            id: str
+            content: str
+            vector: str
+
+        mock_cursor = MagicMock()
+        mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+            connection=mock_connection,
+        )
+        key = "1"
+
+        row = MockRow("1", "test", "[0.1, 0.2, 0.3, 0.4, 0.5]")
+        mock_cursor.description = [["id"], ["content"], ["vector"]]
+
+        mock_cursor.__iter__.return_value = [row]
+        record = await collection.get(key, include_vectors=True)
+        mock_cursor.execute.assert_called_with(
+            "SELECT\n[id], [content], [vector] FROM [dbo].[test] \nWHERE [id] IN\n (?) ;", ("1",)
+        )
+        assert record["id"] == "1"
+        assert record["content"] == "test"
+        assert record["vector"] == [0.1, 0.2, 0.3, 0.4, 0.5]
+
+    async def test_delete(
+        self,
+        sql_server_unit_test_env,
+        mock_connection,
+        definition,
+    ):
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+            connection=mock_connection,
+        )
+        key = "1"
+        await collection.delete(key)
+        mock_connection.cursor.return_value.__enter__.return_value.execute.assert_called_with(
+            "DELETE FROM [dbo].[test] WHERE [id] IN (?) ;", ("1",)
+        )
+
+    async def test_search(
+        self,
+        sql_server_unit_test_env,
+        mock_connection,
+        definition,
+    ):
+        mock_cursor = MagicMock()
+        mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+        for field in definition.vector_fields:
+            field.distance_function = DistanceFunction.COSINE_DISTANCE
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+            connection=mock_connection,
+        )
+        vector = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+        @dataclass
+        class MockRow:
+            id: str
+            content: str
+            _vector_distance_value: float
+
+        row = MockRow("1", "test", 0.1)
+        mock_cursor.description = [["id"], ["content"], ["_vector_distance_value"]]
+
+        mock_cursor.__iter__.return_value = [row]
+        search_result = await collection.search(
+            vector=vector,
+            vector_property_name="vector",
+            filter=lambda x: x.content == "test",
+        )
+        async for record in search_result.results:
+            assert record.record["id"] == "1"
+            assert record.record["content"] == "test"
+            assert record.score == 0.1
+        mock_cursor.execute.assert_called_with(
+            (
+                "SELECT [id], [content], VECTOR_DISTANCE('cosine', [vector], CAST(? AS VECTOR(5))) as "
+                "_vector_distance_value\n FROM [dbo].[test] \n WHERE [content] = ? \nORDER BY _vector_distance_value "
+                "ASC\nOFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY;"
+            ),
+            (json.dumps(vector), "test"),
+        )
+
+    async def test_ensure_collection_exists(
+        self,
+        sql_server_unit_test_env,
+        mock_connection,
+        definition,
+    ):
+        for field in definition.vector_fields:
+            field.index_kind = IndexKind.FLAT
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+            connection=mock_connection,
+        )
+        await collection.ensure_collection_exists()
+        mock_connection.cursor.return_value.__enter__.return_value.execute.assert_called_with(
+            (
+                "IF OBJECT_ID(N'[dbo].[test]', N'U') IS NULL\n"
+                "BEGIN\nCREATE TABLE [dbo].[test] \n ([id] nvarchar"
+                "(255) NOT NULL,\n[content] nvarchar(max) NULL,\n[vector] VECTOR(5) NULL,\n"
+                "PRIMARY KEY ([id]) \n) ;"
+                "\nEND\n"
+            ),
+            (),
+        )
+
+    async def test_ensure_collection_deleted(
+        self,
+        sql_server_unit_test_env,
+        mock_connection,
+        definition,
+    ):
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+            connection=mock_connection,
+        )
+        await collection.ensure_collection_deleted()
+        mock_connection.cursor.return_value.__enter__.return_value.execute.assert_called_with(
+            "DROP TABLE IF EXISTS [dbo].[test] ;", ()
+        )
+
+    async def test_no_connection(self, sql_server_unit_test_env, definition):
+        collection = SqlServerCollection(
+            collection_name="test",
+            record_type=dict,
+            definition=definition,
+        )
+        with raises(VectorStoreOperationException):
+            await collection.ensure_collection_exists()
+        with raises(VectorStoreOperationException):
+            await collection.ensure_collection_deleted()
+        with raises(VectorStoreOperationException):
+            await collection.collection_exists()
+        with raises(VectorStoreOperationException):
+            await collection.upsert({"id": "1", "content": "test", "vector": [0.1, 0.2, 0.3, 0.4, 0.5]})
+        with raises(VectorStoreOperationException):
+            await collection.get("1")
+        with raises(VectorStoreOperationException):
+            await collection.delete("1")
+
+
+@fixture
+def filter_collection(sql_server_unit_test_env):
+    @vectorstoremodel
+    @dataclass
+    class FilterRecord:
+        id: Annotated[int, VectorStoreField("key")]
+        tenant: Annotated[str, VectorStoreField("data")]
+        active: Annotated[bool, VectorStoreField("data")] = False
+        embedding: Annotated[
+            list[float],
+            VectorStoreField("vector", dimensions=3, distance_function=DistanceFunction.COSINE_DISTANCE),
+        ] = None
+
+    return SqlServerCollection(
+        collection_name="filter_records",
+        record_type=FilterRecord,
+        env_file_path="test.env",
+    )
+
+
+@mark.parametrize(
+    "expression, expected_sql, expected_params",
+    [
+        ("x.tenant == None", "[tenant] IS NULL", []),
+        ("x.tenant != None", "[tenant] IS NOT NULL", []),
+        ("x.tenant is None", "[tenant] IS NULL", []),
+        ("x.tenant is not None", "[tenant] IS NOT NULL", []),
+        ("None == x.tenant", "[tenant] IS NULL", []),
+        ("None != x.tenant", "[tenant] IS NOT NULL", []),
+        ("None is x.tenant", "[tenant] IS NULL", []),
+        ("None is not x.tenant", "[tenant] IS NOT NULL", []),
+        ("None == None", "(1 = 1)", []),
+        ("None != None", "(1 = 0)", []),
+        ("None is None", "(1 = 1)", []),
+        ("None is not None", "(1 = 0)", []),
+        ("'value' != None", "(1 = 1)", []),
+        ("None == 'value'", "(1 = 0)", []),
+        ("'value' is not None", "(1 = 1)", []),
+        ("None is 'value'", "(1 = 0)", []),
+        ("0 != None", "(1 = 1)", []),
+        ("False == None", "(1 = 0)", []),
+        ("not x.tenant == None", "NOT ([tenant] IS NULL)", []),
+        ("not x.tenant != None", "NOT ([tenant] IS NOT NULL)", []),
+        ("x.tenant == None or x.id == 1", "([tenant] IS NULL OR [id] = ?)", ["1"]),
+        ("None == x.tenant == None", "([tenant] IS NULL AND [tenant] IS NULL)", []),
+        ("'value' == x.tenant != None", "(? = [tenant] AND [tenant] IS NOT NULL)", ["value"]),
+        ("x.active == True", "[active] = ?", ["1"]),
+        ("x.active == False", "[active] = ?", ["0"]),
+        ("x.active != True", "[active] <> ?", ["1"]),
+        ("x.active != False", "[active] <> ?", ["0"]),
+        ("x.tenant == 'None'", "[tenant] = ?", ["None"]),
+    ],
+)
+def test_null_filter_parser(filter_collection, expression, expected_sql, expected_params):
+    command = filter_collection._build_filter(f"lambda x: {expression}")
+
+    assert str(command) == expected_sql
+    assert command.parameters == expected_params
+
+
+def test_null_filter_query_parameter_order(filter_collection):
+    filters = [
+        "lambda x: x.id > 0",
+        "lambda x: x.tenant == None or x.tenant == 'value'",
+        "lambda x: x.id < 5",
+    ]
+    parsed_filters = filter_collection._build_filter(filters)
+    cmd = _build_search_query(
+        "dbo",
+        "filter_records",
+        filter_collection.definition.key_field,
+        filter_collection.definition.data_fields,
+        filter_collection.definition.vector_fields,
+        [1.0, 0.0, 0.0],
+        VectorSearchOptions(vector_property_name="embedding", filter=filters),
+        filter=parsed_filters,
+    )
+
+    assert str(cmd) == (
+        "SELECT [id], [tenant], [active], VECTOR_DISTANCE('cosine', [embedding], CAST(? AS VECTOR(3))) as "
+        "_vector_distance_value\n"
+        " FROM [dbo].[filter_records] \n"
+        " WHERE [id] > ? \n"
+        " AND ([tenant] IS NULL OR [tenant] = ?) \n"
+        " AND [id] < ? \n"
+        "ORDER BY _vector_distance_value ASC\n"
+        "OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY;"
+    )
+    assert cmd.parameters == ["[1.0, 0.0, 0.0]", "0", "value", "5"]
+
+
+def test_dynamic_null_filter(filter_collection):
+    filter = default_dynamic_filter_function(parameters=[KernelParameterMetadata(name="tenant")], tenant=None)
+    clause = filter_collection._build_filter(filter)
+
+    assert str(clause) == "[tenant] IS NULL"
+    assert clause.parameters == []
+
+
+def test_unsupported_is_operator(filter_collection):
+    with raises(NotImplementedError, match="Unsupported operator"):
+        filter_collection._build_filter("lambda x: x.tenant is 'test'")
